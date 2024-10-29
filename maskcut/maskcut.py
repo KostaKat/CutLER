@@ -19,7 +19,7 @@ import pycocotools.mask as mask_util
 from scipy import ndimage
 from scipy.linalg import eigh
 import json
-
+from pre import *
 import dino
 # modfied by Xudong Wang based on third_party/TokenCut
 sys.path.append('../')
@@ -164,8 +164,8 @@ def maskcut(img_path, backbone,patch_size, tau, N=1, fixed_size=480, cpu=False) 
     I_new = I.resize((int(fixed_size), int(fixed_size)), PIL.Image.LANCZOS)
     I_resize, w, h, feat_w, feat_h = utils.resize_pil(I_new, patch_size)
 
-    tensor = ToTensor(I_resize).unsqueeze(0)
-    if not cpu: tensor = tensor.cuda()
+    tensor = ToTensor(I_resize).unsqueeze(0).to('cuda')
+    if not cpu: tensor = tensor.to('cuda')
     feat = backbone(tensor)[0]
 
     _, bipartition, eigvec = maskcut_forward(feat, [feat_h, feat_w], [patch_size, patch_size], [h,w], tau, N=N, cpu=cpu)
@@ -301,9 +301,33 @@ category_info = {
     "is_crowd": 0,
     "id": 1
 }
+def list_files_in_chunks(directory, chunk_size):
+    # Generator that yields chunks of file paths
+    chunk = []
+    for entry in os.scandir(directory):
+        if entry.is_file():
+            chunk.append(entry.name)
+            if len(chunk) == chunk_size:
+                yield chunk
+                chunk = []  # Start a new chunk
+    if chunk:
+        yield chunk  # Yield the last chunk if it's not empty
+
+def get_last_processed_chunk(output_dir):
+    # Check if a checkpoint file exists with the last processed chunk index
+    checkpoint_file = os.path.join(output_dir, 'checkpoint.txt')
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, 'r') as f:
+            return int(f.read().strip())
+    return 0  # If no checkpoint exists, start from the first chunk
+
+def save_checkpoint(output_dir, chunk_idx):
+    # Save the last successfully processed chunk index to a checkpoint file
+    checkpoint_file = os.path.join(output_dir, 'checkpoint.txt')
+    with open(checkpoint_file, 'w') as f:
+        f.write(str(chunk_idx))
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser('MaskCut script')
     # default arguments
     parser.add_argument('--out-dir', type=str, help='output directory')
@@ -311,18 +335,14 @@ if __name__ == "__main__":
     parser.add_argument('--vit-feat', type=str, default='k', choices=['k', 'q', 'v', 'kqv'], help='which features')
     parser.add_argument('--patch-size', type=int, default=16, choices=[16, 8], help='patch size')
     parser.add_argument('--nb-vis', type=int, default=20, choices=[1, 200], help='nb of visualization')
-    parser.add_argument('--img-path', type=str, default=None, help='single image visualization')
-
-    # additional arguments
     parser.add_argument('--dataset-path', type=str, default="imagenet/train/", help='path to the dataset')
     parser.add_argument('--tau', type=float, default=0.2, help='threshold used for producing binary graph')
-    parser.add_argument('--num-folder-per-job', type=int, default=1, help='the number of folders each job processes')
-    parser.add_argument('--job-index', type=int, default=0, help='the index of the job (for imagenet: in the range of 0 to 1000/args.num_folder_per_job-1)')
+    parser.add_argument('--chunk-size', type=int, default=1000, help='number of images to process per chunk')
+    parser.add_argument('--job-index', type=int, default=0, help='index of the chunk to process (e.g., for parallel processing)')
     parser.add_argument('--fixed_size', type=int, default=480, help='rescale the input images to a fixed size')
     parser.add_argument('--pretrain_path', type=str, default=None, help='path to pretrained model')
     parser.add_argument('--N', type=int, default=3, help='the maximum number of pseudo-masks per image')
     parser.add_argument('--cpu', action='store_true', help='use cpu')
-
     args = parser.parse_args()
 
     if args.pretrain_path is not None:
@@ -336,81 +356,91 @@ if __name__ == "__main__":
             url = "https://dl.fbaipublicfiles.com/dino/dino_deitsmall8_300ep_pretrain/dino_deitsmall8_300ep_pretrain.pth"
         feat_dim = 384
 
-    backbone = dino.ViTFeat(url, feat_dim, args.vit_arch, args.vit_feat, args.patch_size)
+    # Load the backbone model
+    backbone = dino.ViTFeat(args.pretrain_path, feat_dim, args.vit_arch, args.vit_feat, args.patch_size)
 
     msg = 'Load {} pre-trained feature...'.format(args.vit_arch)
-    print (msg)
+    print(msg)
     backbone.eval()
     if not args.cpu:
         backbone.cuda()
+        print("Using CUDA")
 
-    img_folders = os.listdir(args.dataset_path)
+    print("Processing files in chunks...")
 
-    if args.out_dir is not None and not os.path.exists(args.out_dir) :
-        os.mkdir(args.out_dir)
+    # Get the last processed chunk
+    start_chunk = get_last_processed_chunk(args.out_dir)
 
-    start_idx = max(args.job_index*args.num_folder_per_job, 0)
-    end_idx = min((args.job_index+1)*args.num_folder_per_job, len(img_folders))
+    # Process files in chunks
+    for chunk_idx, img_chunk in enumerate(list_files_in_chunks(args.dataset_path, args.chunk_size)):
+        # Skip previously processed chunks
+        if chunk_idx < start_chunk:
+            continue
 
-    image_id, segmentation_id = 1, 1
-    image_names = []
-    for img_folder in img_folders[start_idx:end_idx]:
-        args.img_dir = os.path.join(args.dataset_path, img_folder)
-        img_list = sorted(os.listdir(args.img_dir))
+        print(f"Processing chunk {chunk_idx + 1}")
+        
+        if args.out_dir is not None and not os.path.exists(args.out_dir):
+            os.mkdir(args.out_dir)
 
-        for img_name in tqdm(img_list) :
-            # get image path
-            img_path = os.path.join(args.img_dir, img_name)
-            # get pseudo-masks for each image using MaskCut
+        image_id, segmentation_id = 1, 1
+        image_names = []
+
+        for img_name in tqdm(img_chunk):
+            img_path = os.path.join(args.dataset_path, img_name)
+            # Apply MaskCut on each image
             try:
-                bipartitions, _, I_new = maskcut(img_path, backbone, args.patch_size, \
-                    args.tau, N=args.N, fixed_size=args.fixed_size, cpu=args.cpu)
+                bipartitions, _, I_new = maskcut(img_path, backbone, args.patch_size, args.tau, N=args.N, fixed_size=args.fixed_size, cpu=args.cpu)
             except:
                 print(f'Skipping {img_name}')
                 continue
 
+            # Open the original image
             I = Image.open(img_path).convert('RGB')
+            I = MineralPreprocessing().preprocess_image(np.array(I))
+            if isinstance(I, np.ndarray):
+                I = Image.fromarray(I)
             width, height = I.size
-            for idx, bipartition in enumerate(bipartitions):
-                # post-process pesudo-masks with CRF
-                pseudo_mask = densecrf(np.array(I_new), bipartition)
-                pseudo_mask = ndimage.binary_fill_holes(pseudo_mask>=0.5)
 
-                # filter out the mask that have a very different pseudo-mask after the CRF
+            for idx, bipartition in enumerate(bipartitions):
+                # Post-process pseudo-masks with CRF
+                pseudo_mask = densecrf(np.array(I_new), bipartition)
+                pseudo_mask = ndimage.binary_fill_holes(pseudo_mask >= 0.5)
+
+                # Filter out masks based on the IoU threshold
                 mask1 = torch.from_numpy(bipartition)
                 mask2 = torch.from_numpy(pseudo_mask)
-                if not args.cpu: 
+                if not args.cpu:
                     mask1 = mask1.cuda()
                     mask2 = mask2.cuda()
                 if metric.IoU(mask1, mask2) < 0.5:
                     pseudo_mask = pseudo_mask * -1
 
-                # construct binary pseudo-masks
+                # Convert the pseudo mask back to binary
                 pseudo_mask[pseudo_mask < 0] = 0
-                pseudo_mask = Image.fromarray(np.uint8(pseudo_mask*255))
+                pseudo_mask = Image.fromarray(np.uint8(pseudo_mask * 255))
                 pseudo_mask = np.asarray(pseudo_mask.resize((width, height)))
 
-                # create coco-style image info
+                # Create COCO-style image info
                 if img_name not in image_names:
-                    image_info = create_image_info(
-                        image_id, "{}/{}".format(img_folder, img_name), (height, width, 3))
+                    image_info = create_image_info(image_id, img_name, (height, width, 3))
                     output["images"].append(image_info)
-                    image_names.append(img_name)           
+                    image_names.append(img_name)
 
-                # create coco-style annotation info
-                annotation_info = create_annotation_info(
-                    segmentation_id, image_id, category_info, pseudo_mask.astype(np.uint8), None)
+                # Create COCO-style annotation info
+                annotation_info = create_annotation_info(segmentation_id, image_id, category_info, pseudo_mask.astype(np.uint8), None)
                 if annotation_info is not None:
                     output["annotations"].append(annotation_info)
                     segmentation_id += 1
+
             image_id += 1
 
-    # save annotations
-    if len(img_folders) == args.num_folder_per_job and args.job_index == 0:
-        json_name = '{}/imagenet_train_fixsize{}_tau{}_N{}.json'.format(args.out_dir, args.fixed_size, args.tau, args.N)
-    else:
-        json_name = '{}/imagenet_train_fixsize{}_tau{}_N{}_{}_{}.json'.format(args.out_dir, args.fixed_size, args.tau, args.N, start_idx, end_idx)
-    with open(json_name, 'w') as output_json_file:
-        json.dump(output, output_json_file)
-    print(f'dumping {json_name}')
-    print("Done: {} images; {} anns.".format(len(output['images']), len(output['annotations'])))
+        # Save the current chunk as a checkpoint
+        save_checkpoint(args.out_dir, chunk_idx)
+
+        # Save the output annotations for this chunk
+        json_name = '{}/pseudo_masks_chunk_{}.json'.format(args.out_dir, chunk_idx)
+        with open(json_name, 'w') as output_json_file:
+            json.dump(output, output_json_file)
+
+        print(f'Dumping {json_name}')
+        print(f"Done: {len(output['images'])} images; {len(output['annotations'])} annotations.")

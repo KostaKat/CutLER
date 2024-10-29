@@ -11,7 +11,7 @@ import torch
 from torchvision import transforms
 from scipy import ndimage
 from detectron2.utils.colormap import random_color
-
+from pre import *
 import dino # model
 from third_party.TokenCut.unsupervised_saliency_detection import metric
 from crf import densecrf
@@ -72,6 +72,8 @@ if __name__ == "__main__":
         N=args.N, fixed_size=args.fixed_size, cpu=args.cpu)
 
     I = Image.open(args.img_path).convert('RGB')
+    I = MineralPreprocessing().preprocess_image(np.array(I))
+    I = Image.fromarray(I)
     width, height = I.size
     pseudo_mask_list = []
     for idx, bipartition in enumerate(bipartitions):

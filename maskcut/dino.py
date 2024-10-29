@@ -288,11 +288,21 @@ class ViTFeat(nn.Module):
         self.vit_feat = vit_feat
         self.patch_size = patch_size
 
-#        state_dict = torch.load(pretrained_pth, map_location="cpu")
-        state_dict = torch.hub.load_state_dict_from_url(pretrained_pth)
-        self.model.load_state_dict(state_dict, strict=True)
-        print('Loading weight from {}'.format(pretrained_pth))
+        # Load the pre-trained weights
+        checkpoint = torch.load("/home/kosta/dino/output/checkpoint.pth")
 
+        # Extract the state_dict from the checkpoint
+        state_dict = checkpoint['student']  # or use the appropriate key if it's different
+
+        # Strip the 'module.backbone.' prefix from the keys in the state_dict
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.backbone.'):
+                new_state_dict[k[len('module.backbone.'):]] = v
+            else:
+                new_state_dict[k] = v
+        # Load the updated state_dict into the model
+        self.model.load_state_dict(new_state_dict, strict=False)  # strict=False allows skipping missing keys
 
     def forward(self, img) :
         feat_out = {}
